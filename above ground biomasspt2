@@ -1,0 +1,165 @@
+// ****************************************************
+// Part-2: Building a Regression Model
+// ****************************************************
+
+// Import the Assets
+// ****************************************************
+
+// Direct asset paths with correct names
+var s2Composite = ee.Image('projects/digital-gearbox-460606-g2/assets/2s2_composite');
+var demBands    = ee.Image('projects/digital-gearbox-460606-g2/assets/2dem_bands');
+var gediMosaic  = ee.Image('projects/digital-gearbox-460606-g2/assets/2gedi_mosaic');
+
+// Export path for predicted output
+var exportPath = 'projects/digital-gearbox-460606-g2/assets/';
+
+// Get the image footprint to be used as geometry
+var geometry = s2Composite.geometry();
+Map.centerObject(geometry);
+
+var rgbVis = {
+  min: 0.0, max: 0.3, gamma: 1.2,
+  bands: ['B4', 'B3', 'B2'],
+};
+Map.addLayer(s2Composite, rgbVis, 'Sentinel-2 Composite', false);
+
+var gediVis = {
+  min: 0, max: 200,
+  palette: ['#edf8fb','#b2e2e2','#66c2a4','#2ca25f','#006d2c'],
+  bands: ['agbd']
+};
+Map.addLayer(gediMosaic, gediVis, 'GEDI L4A (Filtered)', false);
+
+// Resample to a Grid
+// ****************************************************
+var gridScale = 100;
+var gridProjection = ee.Projection('EPSG:3857').atScale(gridScale);
+
+var stacked = s2Composite
+  .addBands(demBands)
+  .addBands(gediMosaic);
+
+var stacked = stacked.resample('bilinear');
+
+var stackedResampled = stacked
+  .reduceResolution({
+    reducer: ee.Reducer.mean(),
+    maxPixels: 1024
+  })
+  .reproject({
+    crs: gridProjection
+  });
+
+var stackedResampled = stackedResampled
+  .updateMask(stackedResampled.mask().gt(0));
+
+Map.addLayer(stackedResampled, rgbVis, 'Sentinel-2 (Resampled)');
+Map.addLayer(stackedResampled, gediVis, 'GEDI L4A (Resampled)');
+
+// Extract Training Features
+// ****************************************************
+var predictors = s2Composite.bandNames().cat(demBands.bandNames());
+var predicted = gediMosaic.bandNames().get(0);
+print('Predictors:', predictors);
+print('Predicted:', predicted);
+
+var predictorImage = stackedResampled.select(predictors);
+var predictedImage = stackedResampled.select([predicted]);
+
+var classMask = predictedImage.mask().toInt().rename('class');
+
+var numSamples = 1000;
+
+var training = stackedResampled.addBands(classMask)
+  .stratifiedSample({
+    numPoints: numSamples,
+    classBand: 'class',
+    region: geometry,
+    scale: gridScale,
+    classValues: [0, 1],
+    classPoints: [0, numSamples],
+    dropNulls: true,
+    tileScale: 16,
+  });
+
+print('Number of Features Extracted', training.size());
+print('Sample Training Feature', training.first());
+
+// Train a Regression Model
+// ****************************************************
+var model = ee.Classifier.smileRandomForest(50)
+  .setOutputMode('REGRESSION')
+  .train({
+    features: training,
+    classProperty: predicted,
+    inputProperties: predictors
+  });
+
+var predicted = training.classify({
+  classifier: model,
+  outputName: 'agbd_predicted'
+});
+
+// Calculate RMSE
+var calculateRmse = function(input) {
+  var observed = ee.Array(input.aggregate_array('agbd'));
+  var predicted = ee.Array(input.aggregate_array('agbd_predicted'));
+  var rmse = observed.subtract(predicted).pow(2)
+    .reduce('mean', [0]).sqrt().get([0]);
+  return rmse;
+};
+var rmse = calculateRmse(predicted);
+print('RMSE', rmse);
+
+// Observed vs Predicted scatter plot
+var chart = ui.Chart.feature.byFeature({
+  features: predicted.select(['agbd', 'agbd_predicted']),
+  xProperty: 'agbd',
+  yProperties: ['agbd_predicted'],
+}).setChartType('ScatterChart')
+  .setOptions({
+    title: 'Aboveground Biomass Density (Mg/Ha) - Dhenkanal',
+    dataOpacity: 0.8,
+    hAxis: {'title': 'Observed'},
+    vAxis: {'title': 'Predicted'},
+    legend: {position: 'right'},
+    series: {
+      0: {
+        visibleInLegend: false,
+        color: '#525252',
+        pointSize: 3,
+        pointShape: 'triangle',
+      },
+    },
+    trendlines: {
+      0: {
+        type: 'linear',
+        color: 'black',
+        lineWidth: 1,
+        pointSize: 0,
+        labelInLegend: 'Linear Fit',
+        visibleInLegend: true,
+        showR2: true
+      }
+    },
+    chartArea: {left: 100, bottom: 100, width: '50%'},
+  });
+print(chart);
+
+// Generate Predictions for All Pixels
+// ****************************************************
+var predictedImage = stackedResampled.classify({
+  classifier: model,
+  outputName: 'agbd'
+});
+
+// Export Predicted AGB Image
+// ****************************************************
+Export.image.toAsset({
+  image: predictedImage.clip(geometry),
+  description: 'Predicted_Image_Export',
+  assetId: exportPath + 'predicted_agbd',
+  region: geometry,
+  scale: gridScale,
+  maxPixels: 1e10
+});
