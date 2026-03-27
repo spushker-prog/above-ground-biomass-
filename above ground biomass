@@ -1,0 +1,159 @@
+// ****************************************************
+// Part-1: Preprocessing and Data Preparation
+// ****************************************************
+
+// Load your study area from asset
+// ****************************************************
+var studyArea = ee.FeatureCollection(
+  'projects/digital-gearbox-460606-g2/assets/dhenkanalabgd'
+);
+var geometry = studyArea.geometry();
+Map.centerObject(geometry);
+
+// Select the datasets
+// ****************************************************
+var gedi = ee.ImageCollection('LARSE/GEDI/GEDI04_A_002_MONTHLY');
+var s2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED');
+var glo30 = ee.ImageCollection('COPERNICUS/DEM/GLO30');
+
+// Select a time-period
+// ****************************************************
+var startDate = ee.Date.fromYMD(2022, 1, 1);
+var endDate = startDate.advance(1, 'year');
+
+// Preparing Sentinel-2 composite
+// ****************************************************
+var filteredS2 = s2
+  .filter(ee.Filter.date(startDate, endDate))
+  .filter(ee.Filter.bounds(geometry));
+
+var s2Projection = ee.Image(filteredS2.first()).select('B4').projection();
+
+var scaleBands = function(image) {
+  return image.multiply(0.0001)
+    .copyProperties(image, ['system:time_start']);
+};
+
+var csPlus = ee.ImageCollection('GOOGLE/CLOUD_SCORE_PLUS/V1/S2_HARMONIZED');
+var csPlusBands = csPlus.first().bandNames();
+
+function maskLowQA(image) {
+  var qaBand = 'cs';
+  var clearThreshold = 0.5;
+  var mask = image.select(qaBand).gte(clearThreshold);
+  return image.updateMask(mask);
+}
+
+var addIndices = function(image) {
+  var ndvi = image.normalizedDifference(['B8', 'B4']).rename('ndvi');
+  var mndwi = image.normalizedDifference(['B3', 'B11']).rename('mndwi');
+  var ndbi = image.normalizedDifference(['B11', 'B8']).rename('ndbi');
+  var evi = image.expression(
+    '2.5 * ((NIR - RED)/(NIR + 6*RED - 7.5*BLUE + 1))', {
+      'NIR': image.select('B8'),
+      'RED': image.select('B4'),
+      'BLUE': image.select('B2')
+    }).rename('evi');
+  var bsi = image.expression(
+    '(( X + Y ) - (A + B)) /(( X + Y ) + (A + B))', {
+      'X': image.select('B11'),
+      'Y': image.select('B4'),
+      'A': image.select('B8'),
+      'B': image.select('B2'),
+    }).rename('bsi');
+  return image.addBands(ndvi).addBands(mndwi).addBands(ndbi).addBands(evi).addBands(bsi);
+};
+
+var filteredS2WithCs = filteredS2.linkCollection(csPlus, csPlusBands);
+
+var s2Processed = filteredS2WithCs
+  .map(maskLowQA)
+  .select('B.*')
+  .map(scaleBands)
+  .map(addIndices);
+
+var s2Composite = s2Processed.median().setDefaultProjection(s2Projection);
+
+// Preparing GLO-30 slope and elevation
+// ****************************************************
+var glo30Filtered = glo30.filter(ee.Filter.bounds(geometry)).select('DEM');
+var demProj = glo30Filtered.first().select(0).projection();
+var elevation = glo30Filtered.mosaic().rename('dem').setDefaultProjection(demProj);
+var slope = ee.Terrain.slope(elevation);
+var demBands = elevation.addBands(slope);
+
+// Preparing GEDI L4A Mosaic
+// ****************************************************
+var qualityMask = function(image) {
+  return image.updateMask(image.select('l4_quality_flag').eq(1))
+    .updateMask(image.select('degrade_flag').eq(0));
+};
+
+var errorMask = function(image) {
+  var relative_se = image.select('agbd_se').divide(image.select('agbd'));
+  return image.updateMask(relative_se.lte(0.5));
+};
+
+var slopeMask = function(image) {
+  return image.updateMask(slope.lt(30));
+};
+
+var gediFiltered = gedi
+  .filter(ee.Filter.date(startDate, endDate))
+  .filter(ee.Filter.bounds(geometry));
+
+var gediProjection = ee.Image(gediFiltered.first()).select('agbd').projection();
+
+var gediProcessed = gediFiltered
+  .map(qualityMask)
+  .map(errorMask)
+  .map(slopeMask);
+
+var gediMosaic = gediProcessed.mosaic()
+  .select('agbd').setDefaultProjection(gediProjection);
+
+// Visualization
+// ****************************************************
+var rgbVis = {min: 0.0, max: 0.3, gamma: 1.2, bands: ['B4', 'B3', 'B2']};
+Map.addLayer(s2Composite.clip(geometry), rgbVis, 'Sentinel-2 Composite');
+Map.addLayer(elevation.clip(geometry), {min: 0, max: 1000}, 'Elevation', false);
+Map.addLayer(slope.clip(geometry), {min: 0, max: 45}, 'Slope', false);
+
+var gediVis = {
+  min: 0, max: 200,
+  palette: ['#edf8fb','#b2e2e2','#66c2a4','#2ca25f','#006d2c'],
+  bands: ['agbd']
+};
+Map.addLayer(gediFiltered.mosaic().clip(geometry), gediVis, 'GEDI L4A (Raw)', false);
+Map.addLayer(gediMosaic.clip(geometry), gediVis, 'GEDI L4A (Filtered)');
+
+// Export as Assets
+// ****************************************************
+var exportPath = 'projects/digital-gearbox-460606-g2/assets/';
+
+Export.image.toAsset({
+  image: s2Composite.clip(geometry),
+  description: 'S2_Composite_Export',
+  assetId: exportPath + 's2_composite',
+  region: geometry,
+  scale: 10,
+  maxPixels: 1e10
+});
+
+Export.image.toAsset({
+  image: demBands.clip(geometry),
+  description: 'DEM_Bands_Export',
+  assetId: exportPath + 'dem_bands',
+  region: geometry,
+  scale: 30,
+  maxPixels: 1e10
+});
+
+Export.image.toAsset({
+  image: gediMosaic.clip(geometry),
+  description: 'GEDI_Mosaic_Export',
+  assetId: exportPath + 'gedi_mosaic',
+  region: geometry,
+  scale: 25,
+  maxPixels: 1e10
+});
