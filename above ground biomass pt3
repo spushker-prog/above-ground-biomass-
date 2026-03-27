@@ -1,0 +1,220 @@
+// ****************************************************
+// Part-3: Estimation of Total Biomass
+// ****************************************************
+
+// Import the Assets
+// ****************************************************
+
+var s2Composite = ee.Image('projects/digital-gearbox-460606-g2/assets/2s2_composite');
+var predictedImage = ee.Image('projects/digital-gearbox-460606-g2/assets/predicted_agbd');
+
+var gridProjection = predictedImage.projection();
+var gridScale = gridProjection.nominalScale();
+
+// Get the image footprint to be used as geometry
+var geometry = s2Composite.geometry();
+Map.centerObject(geometry);
+
+var rgbVis = {
+  min: 0.0, max: 0.3, gamma: 1.2,
+  bands: ['B4', 'B3', 'B2'],
+};
+Map.addLayer(s2Composite, rgbVis, 'Sentinel-2 Composite');
+
+var gediVis = {
+  min: 0, max: 200,
+  palette: ['#edf8fb','#b2e2e2','#66c2a4','#2ca25f','#006d2c'],
+  bands: ['agbd']
+};
+Map.addLayer(predictedImage, gediVis, 'Predicted AGBD', false);
+
+// Mask Non-Vegetation Areas
+// ****************************************************
+var worldcover = ee.ImageCollection('ESA/WorldCover/v200').first();
+
+var worldcoverResampled = worldcover
+  .reduceResolution({
+    reducer: ee.Reducer.mode(),
+    maxPixels: 1024
+  })
+  .reproject({
+    crs: gridProjection
+  });
+
+// Vegetation land cover classes:
+// Forests=10, Shrubland=20, Grassland=30, Cropland=40, Mangroves=95
+var landCoverMask = worldcoverResampled.eq(10)
+  .or(worldcoverResampled.eq(20))
+  .or(worldcoverResampled.eq(30))
+  .or(worldcoverResampled.eq(40))
+  .or(worldcoverResampled.eq(95));
+
+var predictedImageMasked = predictedImage.updateMask(landCoverMask);
+Map.addLayer(predictedImageMasked, gediVis, 'Predicted AGBD (Masked)');
+
+// Calculate Total AGB
+// ****************************************************
+var pixelAreaHa = ee.Image.pixelArea().divide(10000);
+var predictedAgb = predictedImageMasked.multiply(pixelAreaHa);
+
+var stats = predictedAgb.reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: geometry,
+  scale: gridScale,
+  maxPixels: 1e10,
+  tileScale: 16
+});
+
+var totalAgb = stats.getNumber('agbd');
+
+// Print results in multiple units
+print('Total AGB (Mg)', totalAgb);
+
+var totalAgbGg = totalAgb.divide(1000);
+print('Total AGB (Gg)', totalAgbGg);
+
+var totalAgbTg = totalAgb.divide(1000000);
+print('Total AGB (Tg)', totalAgbTg);
+
+print('--- Summary for Dhenkanal District ---');
+print('Total AGB in Mg  : 11,276,457.36');
+print('Total AGB in Gg  : 11,276.46');
+print('Total AGB in Tg  : 11.28');
+
+// ****************************************************
+// Data Checks Before Exporting
+// ****************************************************
+
+// 1. Check band names of each image
+print('S2 Composite bands:', s2Composite.bandNames());
+print('Predicted Image bands:', predictedImage.bandNames());
+print('Predicted Masked bands:', predictedImageMasked.bandNames());
+print('Total AGB per pixel bands:', predictedAgb.bandNames());
+print('WorldCover bands:', worldcoverResampled.bandNames());
+
+// 2. Check actual pixel statistics for each layer
+// If min/max/mean are all 0 or null - the image has no data
+
+var checkStats = function(image, bandName, label) {
+  var stats = image.select(bandName).reduceRegion({
+    reducer: ee.Reducer.min()
+      .combine(ee.Reducer.max(), '', true)
+      .combine(ee.Reducer.mean(), '', true)
+      .combine(ee.Reducer.count(), '', true),
+    geometry: geometry,
+    scale: gridScale,
+    maxPixels: 1e10,
+    tileScale: 16
+  });
+  print('--- ' + label + ' ---', stats);
+};
+
+checkStats(s2Composite, 'B4', 'S2 Composite (B4)');
+checkStats(predictedImage, 'agbd', 'Predicted AGBD');
+checkStats(predictedImageMasked, 'agbd', 'Predicted AGBD Masked');
+checkStats(predictedAgb, 'agbd', 'Total AGB per Pixel');
+checkStats(worldcoverResampled, 'Map', 'WorldCover Resampled');
+
+// 3. Check pixel count - if count = 0 the image is empty
+var countCheck = function(image, bandName, label) {
+  var count = image.select(bandName).reduceRegion({
+    reducer: ee.Reducer.count(),
+    geometry: geometry,
+    scale: gridScale,
+    maxPixels: 1e10,
+    tileScale: 16
+  });
+  print('Pixel count - ' + label + ':', count);
+};
+
+countCheck(s2Composite, 'B4', 'S2 Composite');
+countCheck(predictedImage, 'agbd', 'Predicted AGBD');
+countCheck(predictedImageMasked, 'agbd', 'Predicted AGBD Masked');
+countCheck(predictedAgb, 'agbd', 'Total AGB per Pixel');
+countCheck(worldcoverResampled, 'Map', 'WorldCover');
+
+// 4. Visual check on map
+Map.addLayer(s2Composite.clip(geometry), 
+  {min:0, max:0.3, bands:['B4','B3','B2']}, 'CHECK: S2 Composite');
+Map.addLayer(predictedImage.clip(geometry), 
+  {min:0, max:200, palette:['white','green']}, 'CHECK: Predicted AGBD');
+Map.addLayer(predictedImageMasked.clip(geometry), 
+  {min:0, max:200, palette:['white','green']}, 'CHECK: AGBD Masked');
+Map.addLayer(predictedAgb.clip(geometry), 
+  {min:0, max:200, palette:['white','green']}, 'CHECK: AGB per Pixel');
+Map.addLayer(worldcoverResampled.clip(geometry), 
+  {min:10, max:95}, 'CHECK: WorldCover');
+// ****************************************************
+// Export Images to Google Drive for ArcGIS
+// ****************************************************
+
+// 1. Export Sentinel-2 Composite (cast to Float32 to fix type mismatch)
+Export.image.toDrive({
+  image: s2Composite.toFloat().clip(geometry),
+  description: 'S2_Composite_Dhenkanal',
+  folder: 'GEE_Dhenkanal_AGB',
+  fileNamePrefix: 'S2_Composite_Dhenkanal',
+  region: geometry,
+  scale: 10,
+  crs: 'EPSG:4326',
+  maxPixels: 1e10,
+  fileFormat: 'GeoTIFF'
+});
+
+// 2. Export Predicted AGBD Image (unmasked)
+Export.image.toDrive({
+  image: predictedImage.toFloat().clip(geometry),
+  description: 'Predicted_AGBD_Dhenkanal',
+  folder: 'GEE_Dhenkanal_AGB',
+  fileNamePrefix: 'Predicted_AGBD_Dhenkanal',
+  region: geometry,
+  scale: gridScale,
+  crs: 'EPSG:4326',
+  maxPixels: 1e10,
+  fileFormat: 'GeoTIFF'
+});
+
+// 3. Export Predicted AGBD Image (vegetation masked)
+Export.image.toDrive({
+  image: predictedImageMasked.toFloat().clip(geometry),
+  description: 'Predicted_AGBD_Masked_Dhenkanal',
+  folder: 'GEE_Dhenkanal_AGB',
+  fileNamePrefix: 'Predicted_AGBD_Masked_Dhenkanal',
+  region: geometry,
+  scale: gridScale,
+  crs: 'EPSG:4326',
+  maxPixels: 1e10,
+  fileFormat: 'GeoTIFF'
+});
+
+// 4. Export Total AGB per pixel (Mg per pixel)
+Export.image.toDrive({
+  image: predictedAgb.toFloat().clip(geometry),
+  description: 'Total_AGB_perPixel_Dhenkanal',
+  folder: 'GEE_Dhenkanal_AGB',
+  fileNamePrefix: 'Total_AGB_perPixel_Dhenkanal',
+  region: geometry,
+  scale: gridScale,
+  crs: 'EPSG:4326',
+  maxPixels: 1e10,
+  fileFormat: 'GeoTIFF'
+});
+
+// 5. Export ESA WorldCover (resampled land cover)
+Export.image.toDrive({
+  image: worldcoverResampled.toFloat().clip(geometry),
+  description: 'WorldCover_Resampled_Dhenkanal',
+  folder: 'GEE_Dhenkanal_AGB',
+  fileNamePrefix: 'WorldCover_Resampled_Dhenkanal',
+  region: geometry,
+  scale: gridScale,
+  crs: 'EPSG:4326',
+  maxPixels: 1e10,
+  fileFormat: 'GeoTIFF'
+});
+
+/*
+Copyright (c) 2024 Ujaval Gandhi.
+This work is licensed under the terms of the MIT license.
+For a copy, see https://opensource.org/licenses/MIT
+*/
